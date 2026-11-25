@@ -24,6 +24,7 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 #include "hidmem.h"
 #include "usb.h"
 #include "HID_controllers.h"
+#include "nsogc_protocol.h"
 
 #include <stdlib.h>
 #include "ff_utf8.h"
