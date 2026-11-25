@@ -105,7 +105,7 @@ index da95feb..fc398d8 100644
 +    if(state.left) nsogc_virtual_pad[1]|=0x04;
 +    if(state.right) nsogc_virtual_pad[1]|=0x08;
 +    nsogc_virtual_pad[2]=nsogc_axis_to_gc_u8(state.lx);
-+    nsogc_virtual_pad[3]=nsogc_axis_to_gc_u8(state.ly);
++    nsogc_virtual_pad[3]=(u8)(255u - nsogc_axis_to_gc_u8(state.ly));
 +    nsogc_virtual_pad[4]=nsogc_axis_to_gc_u8(state.rx);
 +    nsogc_virtual_pad[5]=nsogc_axis_to_gc_u8(state.ry);
 +    nsogc_virtual_pad[6]=(state.lt < 32) ? 0 : state.lt;
