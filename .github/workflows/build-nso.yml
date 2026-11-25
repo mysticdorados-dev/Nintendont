@@ -1,0 +1,23 @@
+name: Build Nintendont NSO
+
+on:
+  push:
+    branches: [nso-gamecube-usb]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container:
+      image: devkitpro/devkitppc:20210619
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Build Nintendont
+        run: make
+      - name: Upload test build
+        uses: actions/upload-artifact@v4
+        with:
+          name: nintendont-nso-test
+          path: loader/loader.dol
+          if-no-files-found: error
