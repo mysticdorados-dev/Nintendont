@@ -13,6 +13,9 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+      - name: Apply NSO experimental patch
+        run: git apply --check NSO_Integration_v02.patch && git apply NSO_Integration_v02.patch
+        
       - name: Build Nintendont
         run: make
       - name: Upload test build
