@@ -1,0 +1,241 @@
+diff --git a/kernel/HID.c b/kernel/HID.c
+index da95feb..fc398d8 100644
+--- a/kernel/HID.c
++++ b/kernel/HID.c
+@@ -95,6 +95,21 @@ typedef void (*RumbleFunc)(u32 Enable);
+ RumbleFunc HIDRumble = NULL;
+ 
+ static usb_device_entry AttachedDevices[32] ALIGNED(32);
++/* NSO GameCube: composite USB has a vendor bulk interface (0xff) and
++   a separate HID interrupt interface (0x03). The 2014 HID-only path cannot
++   initialize the new Nintendo controller on its own. */
++static s32 nsogc_vendor_host = -1;
++static usb_device_entry nsogc_vendor_devices[32] ALIGNED(32);
++static struct ipcmessage *nsogc_vendor_change_msg = NULL;
++static struct ipcmessage *nsogc_vendor_attach_msg = NULL;
++static volatile u32 nsogc_vendor_change = 0;
++static volatile u32 nsogc_vendor_attach = 0;
++static u8 nsogc_vendor_tx[64] ALIGNED(32);
++static u8 nsogc_vendor_rx[64] ALIGNED(32);
++static s32 nsogc_vendor_id = 0;
++static u32 nsogc_init_ok = 0;
++static u8 nsogc_virtual_pad[32] ALIGNED(32);
++
+ 
+ static struct ipcmessage *hidreadcontrollermsg = NULL, *hidreadkeyboardmsg = NULL, *hidchangemsg = NULL, *hidattachmsg = NULL;
+ static u32 HID_Thread = 0;
+@@ -122,11 +137,21 @@ void HIDInit( void )
+ 	kbbuf = (u8*)malloca( 32,32 );
+ 
+ 	hidheap = (u8*)malloca(64,32);
+-	hidqueue = mqueue_create(hidheap, 3);
++	hidqueue = mqueue_create(hidheap, 6);
+ 	hidreadcontrollermsg = (struct ipcmessage*)malloca(sizeof(struct ipcmessage), 32);
+ 	hidreadkeyboardmsg = (struct ipcmessage*)malloca(sizeof(struct ipcmessage), 32);
+ 	hidchangemsg = (struct ipcmessage*)malloca(sizeof(struct ipcmessage), 32);
+ 	hidattachmsg = (struct ipcmessage*)malloca(sizeof(struct ipcmessage), 32);
++    nsogc_vendor_change_msg = (struct ipcmessage*)malloca(sizeof(struct ipcmessage),32);
++    nsogc_vendor_attach_msg = (struct ipcmessage*)malloca(sizeof(struct ipcmessage),32);
++    nsogc_vendor_host = USB_NSO_GetVendorHandle();
++    if (nsogc_vendor_host >= 0 && nsogc_vendor_change_msg && nsogc_vendor_attach_msg)
++    {
++        memset32(nsogc_vendor_devices, 0, sizeof(nsogc_vendor_devices));
++        IOS_IoctlAsync(nsogc_vendor_host, GetDeviceChange, NULL, 0,
++            nsogc_vendor_devices, 0x180, hidqueue, nsogc_vendor_change_msg);
++    }
++
+ 	HID_Thread = do_thread_create(HIDAlarm, ((u32*)&__hid_stack_addr), ((u32)(&__hid_stack_size)), 0x78);
+ 	thread_continue(HID_Thread);
+ 
+@@ -640,6 +665,69 @@ s32 HIDOpen( u32 LoaderRequest )
+ 	return 0;
+ }
+ 
++/* Start report 0x0A on the vendor/bulk USB interface. The command
++   sequence is the same one demonstrated in the vWii probe Build #4.
++   This is an experimental path: synchronous USB reads have no explicit
++   timeout at this layer; test ONLY with the intended device attached. */
++static s32 NSOGCInitVendor(s32 device_id)
++{
++    s32 ret;
++    unsigned int i;
++    s32 io_buffer[8] ALIGNED(32);
++
++    memset32(io_buffer,0,32);
++    io_buffer[0] = device_id;
++    io_buffer[2] = 1; /* resume */
++    ret = IOS_Ioctl(nsogc_vendor_host, ResumeDevice, io_buffer,32,NULL,0);
++    if (ret < 0) return ret;
++
++    for(i=0; i<NSOGC_INIT_COUNT; ++i)
++    {
++        memset32(nsogc_vendor_tx,0,64);
++        memcpy(nsogc_vendor_tx, nsogc_init_sequence[i].bytes,
++               nsogc_init_sequence[i].length);
++        sync_after_write(nsogc_vendor_tx,64);
++        ret = USB_WriteBlkMsg(device_id, NSOGC_USB_VENDOR_OUT,
++                    nsogc_init_sequence[i].length, nsogc_vendor_tx);
++        if(ret < 0) return ret;
++        memset32(nsogc_vendor_rx,0,64);
++        sync_after_write(nsogc_vendor_rx,64);
++        ret = USB_ReadBlkMsg(device_id, NSOGC_USB_VENDOR_IN,64,nsogc_vendor_rx);
++        if(ret < 0) return ret;
++        sync_before_read(nsogc_vendor_rx,64);
++    }
++    return 0;
++}
++
++static void NSOGCVirtualize(const u8 *src, u32 length)
++{
++    nsogc_pad_state state;
++    if(nsogc_parse_gc_report(src,length,&state) != 0) return;
++    memset32(nsogc_virtual_pad,0,32);
++    if(state.a) nsogc_virtual_pad[0]|=0x01;
++    if(state.b) nsogc_virtual_pad[0]|=0x02;
++    if(state.x) nsogc_virtual_pad[0]|=0x04;
++    if(state.y) nsogc_virtual_pad[0]|=0x08;
++    if(state.z) nsogc_virtual_pad[0]|=0x10;
++    if(state.start) nsogc_virtual_pad[0]|=0x20;
++    /* NSO GameCube triggers have analogue travel; digital click threshold
++       is provisional until hardware-calibrated by game testing. */
++    if(state.lt >= 180 || state.left_shoulder) nsogc_virtual_pad[0]|=0x40;
++    if(state.rt >= 180) nsogc_virtual_pad[0]|=0x80;
++    if(state.up) nsogc_virtual_pad[1]|=0x01;
++    if(state.down) nsogc_virtual_pad[1]|=0x02;
++    if(state.left) nsogc_virtual_pad[1]|=0x04;
++    if(state.right) nsogc_virtual_pad[1]|=0x08;
++    nsogc_virtual_pad[2]=nsogc_axis_to_gc_u8(state.lx);
++    nsogc_virtual_pad[3]=nsogc_axis_to_gc_u8(state.ly);
++    nsogc_virtual_pad[4]=nsogc_axis_to_gc_u8(state.rx);
++    nsogc_virtual_pad[5]=nsogc_axis_to_gc_u8(state.ry);
++    nsogc_virtual_pad[6]=(state.lt < 32) ? 0 : state.lt;
++    nsogc_virtual_pad[7]=(state.rt < 32) ? 0 : state.rt;
++    memcpy(HID_Packet,nsogc_virtual_pad,32);
++    sync_after_write(HID_Packet,32);
++}
++
+ void HIDClose()
+ {
+ 	IOS_Close(HIDHandle);
+@@ -659,6 +747,10 @@ static u32 HIDAlarm()
+ 			keyboardread = 1;
+ 		else if(msg == hidchangemsg)
+ 			hidchange = 1;
++        else if(msg == nsogc_vendor_change_msg)
++            nsogc_vendor_change = 1;
++        else if(msg == nsogc_vendor_attach_msg)
++            nsogc_vendor_attach = 1;
+ 		else
+ 			hidattach = 1;
+ 	}
+@@ -868,8 +960,13 @@ void HIDIRQRead()
+ 			goto dohidirqread;
+ 			break;
+ 	}
+-	memcpy(HID_Packet, Packet, wMaxPacketSize);
+-	sync_after_write(HID_Packet, wMaxPacketSize);
++    if(HID_CTRL->VID == NSOGC_USB_VID && HID_CTRL->PID == NSOGC_USB_PID)
++        NSOGCVirtualize(Packet,wMaxPacketSize);
++    else
++    {
++        memcpy(HID_Packet, Packet, wMaxPacketSize);
++        sync_after_write(HID_Packet, wMaxPacketSize);
++    }
+ dohidirqread:
+ 	HIDInterruptMessage(0, Packet, wMaxPacketSize, bEndpointAddressController, hidqueue, hidreadcontrollermsg);
+ }
+@@ -1044,8 +1141,42 @@ static void KeyboardRead()
+ 
+ void HIDUpdateRegisters(u32 LoaderRequest)
+ {
+-	if(TimerDiffTicks(HID_Timer) > 3800)	// about 500 times a second
+-	{
++    if(TimerDiffTicks(HID_Timer) > 3800)    // about 500 times a second
++    {
++        if(nsogc_vendor_change && nsogc_vendor_host >= 0)
++        {
++            nsogc_vendor_change = 0;
++            IOS_IoctlAsync(nsogc_vendor_host, AttachFinish, NULL, 0,
++                NULL, 0, hidqueue, nsogc_vendor_attach_msg);
++        }
++        if(nsogc_vendor_attach && nsogc_vendor_host >= 0)
++        {
++            u32 j;
++            nsogc_vendor_attach = 0;
++            sync_before_read(nsogc_vendor_devices,sizeof(nsogc_vendor_devices));
++            nsogc_vendor_id = 0;
++            for(j=0; j<32; ++j)
++                if(nsogc_vendor_devices[j].vid == NSOGC_USB_VID &&
++                   nsogc_vendor_devices[j].pid == NSOGC_USB_PID)
++                {
++                    nsogc_vendor_id=nsogc_vendor_devices[j].device_id;
++                    break;
++                }
++            if(nsogc_vendor_id)
++            {
++                /* Device IDs are allowed to be NEGATIVE in IOS58;
++                   zero, not negative, means absent. */
++                if(NSOGCInitVendor(nsogc_vendor_id) >= 0)
++                    nsogc_init_ok=1;
++                else
++                    nsogc_init_ok=0;
++            }
++            else nsogc_init_ok=0;
++            memset32(nsogc_vendor_devices,0,sizeof(nsogc_vendor_devices));
++            IOS_IoctlAsync(nsogc_vendor_host, GetDeviceChange, NULL, 0,
++                nsogc_vendor_devices,0x180,hidqueue,nsogc_vendor_change_msg);
++        }
++
+ 		if(hidchange == 1)
+ 		{
+ 			hidattached = 0;
+diff --git a/kernel/HID_controllers.h b/kernel/HID_controllers.h
+index fdc38d3..f550fa9 100644
+--- a/kernel/HID_controllers.h
++++ b/kernel/HID_controllers.h
+@@ -56,6 +56,13 @@ controller DefControllers[] = {
+ 	{0x4, 0xf0}, {0x4, 0x1}, {0x4, 0x2}, {0x4, 0x8}, {0x4, 0x4}, {0x0, 0x0}, {0x4, 0x20}, {0x4, 0x80}, {0x4, 0x10}, {0x4, 0x40},
+ 	{0x5, 0x60}, {0x5, 0x40}, {0x5, 0x20}, {0x5, 0x0}, {0x5, 0x10}, {0x5, 0x30}, {0x5, 0x50}, {0x5, 0x70}, 
+ 	{0x0, 0x0, 0x320}, {0x1, 0x0, 0x320}, {0x2, 0x0, 0x320}, {0x3, 0x0, 0x320}, 0x0, 0x21 },
++	/* NSO GameCube Switch 2 (057e:2073). HID.c builds a virtual 8-bit report
++	   because the original controller sends packed 12-bit axes in report 0x0a. */
++	{ 0x057e, 0x2073, 1, 0, 0x0f, 0, 0, 0,
++	{0x0,0x0}, {0x0,0x01}, {0x0,0x02}, {0x0,0x04}, {0x0,0x08}, {0x0,0x00}, {0x0,0x10}, {0x0,0x40}, {0x0,0x80}, {0x0,0x20},
++	{0x1,0x04}, {0x1,0x02}, {0x1,0x08}, {0x1,0x01},
++	{0x0,0x0}, {0x0,0x0}, {0x0,0x0}, {0x0,0x0},
++	{0x2,0,1000}, {0x3,0,1000}, {0x4,0,1000}, {0x5,0,1000}, 0x6, 0x7 },
+ 	{ 0x057e, 0x0337, 1, 1, 0xf0, 0, 3, 9,
+ 	{0x3, 0xf}, {0x2, 0x1}, {0x2, 0x2}, {0x2, 0x4}, {0x2, 0x8}, {0x0, 0x0}, {0x3, 0x2}, {0x3, 0x8}, {0x3, 0x4}, {0x3, 0x1},
+ 	{0x2, 0x10}, {0x2, 0x40}, {0x2, 0x20}, {0x2, 0x80}, {0x2, 0xa0}, {0x2, 0x60}, {0x2, 0x50}, {0x2, 0x90}, 
+diff --git a/kernel/usb.c b/kernel/usb.c
+index 1141f26..26d889b 100644
+--- a/kernel/usb.c
++++ b/kernel/usb.c
+@@ -125,6 +125,14 @@ s32 USB_Initialize()
+ 	return IPC_OK;
+ }
+ 
++/* Allow the NSO controller bootstrap to reuse the USB-storage vendor host.
++   A second open of /dev/usb/ven may fail on IOS58. */
++s32 USB_NSO_GetVendorHandle(void)
++{
++    if (ven_fd < 0) USB_Initialize();
++    return ven_fd;
++}
++
+ s32 USB_Deinitialize()
+ {
+ 	if (ven_fd >= 0) {
+diff --git a/kernel/usb.h b/kernel/usb.h
+index 7b5ecf3..77686b5 100644
+--- a/kernel/usb.h
++++ b/kernel/usb.h
+@@ -144,6 +144,8 @@ struct _usb_msg {
+ 	ioctlv vec[7];
+ };
+ 
++/* Shared IOS58 vendor host (also used by USB storage). */
++s32 USB_NSO_GetVendorHandle(void);
+ s32 USB_Initialize();
+ s32 USB_Deinitialize();
+ 
